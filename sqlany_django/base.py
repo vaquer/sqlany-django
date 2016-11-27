@@ -93,9 +93,16 @@ class CursorWrapper(object):
         if djangoVersion[:2] >= (1, 4) and settings.USE_TZ:
             args = _datetimes_in(args)
         try:
-            if args != None:
+            #query, args = self._convert_sql_to_11_version(query, args)
+
+            if args != None and 'INSERT' not in query[:7]:
                 query = self.convert_query(query, len(args))
-            ret = self.cursor.execute(trace(query), trace(args))
+            print '*' * 20
+            print query
+            print args
+            print '*' * 20
+
+            ret = self.cursor.execute(trace(query), trace(args)) if 'INSERT' not in query[:7] else self.cursor.execute(query % (args))
             return ret
         except Database.OperationalError as e:
             if e.message == 'Connection was terminated':
@@ -109,6 +116,68 @@ class CursorWrapper(object):
             if e.errorcode in self.codes_for_integrityerror:
                 raise Database.IntegrityError(e)
             raise
+
+    def _convert_sql_to_11_version(self, query, args):
+        import sqlparse
+        from sqlparse import Parenthesis, Keyword
+
+        parsed_sql = sqlparse.parse(query)
+
+        if 'INSERT' not in parsed_sql[0].tokens[0].value:
+            return (query, args)
+
+        for token in parsed_sql.tokens:
+            if not isinstance(token, Keyword):
+                next
+
+            if token.value == 'VALUES':
+                index_values = parsed_sql.token_index(token)
+                break
+
+        count_parenthesis = 0
+        len_content_parenthesis = 0
+        for token in parsed_sql.tokens[:index_values]:
+            if not isinstance(token, Parenthesis):
+                next
+
+            if len_content_parenthesis == 0 and  count_parenthesis == 0:
+                len_content_parenthesis = len(token.tokens)
+
+            count_parenthesis += 1
+
+        placeholder_params = list('%s' * len_content_parenthesis)
+        new_sql = sql[:sql.find('VALUES') + len('VALUES')] + placeholder_params.join(',')
+
+        if count_parenthesis == 0:
+            raise ValueError("No values on INSERT statement")
+
+        new_params = args if count_parenthesis == 1 else self._get_new_params_ver_11(args, count_parenthesis, len_content_parenthesis)
+
+        return (new_sql, new_params)
+
+    def _get_new_params_ver_11(self, args, count_parenthesis, len_content_parenthesis):
+        params = ()
+        param_group = ()
+        count = 0
+        for param in args:
+            param_group.append(self._transform_param_type(param))
+
+            if count % len_content_parenthesis == 0:
+                params.append(param_group)
+                param_group = ()
+
+        return params
+
+    def _transform_param_type(param):
+        try:
+            return int(param)
+        except:
+            return "'%s'" % param
+
+        try:
+            return float(param)
+        except:
+            return "'%s'" % param
 
     def executemany(self, query, args):
         if djangoVersion[:2] >= (1, 4) and settings.USE_TZ:

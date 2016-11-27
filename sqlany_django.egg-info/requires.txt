@@ -1,0 +1,2 @@
+sqlanydb >= 1.0.4
+sqlparse==0.2.2
