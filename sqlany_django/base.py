@@ -93,16 +93,19 @@ class CursorWrapper(object):
         if djangoVersion[:2] >= (1, 4) and settings.USE_TZ:
             args = _datetimes_in(args)
         try:
-            #query, args = self._convert_sql_to_11_version(query, args)
+            query, args = self._convert_sql_insert_to_11_version(query, args)
 
-            if args != None and 'INSERT' not in query[:7]:
+            if args != None and 'INSERT INTO' not in query:
                 query = self.convert_query(query, len(args))
-            print '*' * 20
-            print query
-            print args
-            print '*' * 20
 
-            ret = self.cursor.execute(trace(query), trace(args)) if 'INSERT' not in query[:7] else self.cursor.execute(query % (args))
+            if len(args) == 0:
+                ret = self.cursor.execute(trace(query), trace(args))
+            else:
+                if type(args[0]) is tuple:
+                    ret = self.cursor.executemany(trace(query), trace(args))
+                else:
+                    ret = self.cursor.execute(trace(query), trace(args))
+
             return ret
         except Database.OperationalError as e:
             if e.message == 'Connection was terminated':
@@ -117,67 +120,96 @@ class CursorWrapper(object):
                 raise Database.IntegrityError(e)
             raise
 
-    def _convert_sql_to_11_version(self, query, args):
+    def _convert_sql_insert_to_11_version(self, query, args):
+        """
+        Function: Convert inserts with many rows
+                  in old fashion style for sqlanywhere v11.0
+        Return: <tuple>
+        """
         import sqlparse
-        from sqlparse import Parenthesis, Keyword
+        from sqlparse.sql import Parenthesis, IdentifierList
+        from sqlparse.tokens import Token
 
         parsed_sql = sqlparse.parse(query)
 
+        # If is not an insert skip the query
         if 'INSERT' not in parsed_sql[0].tokens[0].value:
             return (query, args)
 
-        for token in parsed_sql.tokens:
-            if not isinstance(token, Keyword):
-                next
+        index_values = 0
+        # Search the VALUES section of the Query
+        for token in parsed_sql[0].tokens:
+            if token.ttype is not Token.Keyword:
+                continue
 
             if token.value == 'VALUES':
-                index_values = parsed_sql.token_index(token)
+                index_values = parsed_sql[0].token_index(token)
                 break
 
         count_parenthesis = 0
         len_content_parenthesis = 0
-        for token in parsed_sql.tokens[:index_values]:
-            if not isinstance(token, Parenthesis):
-                next
 
-            if len_content_parenthesis == 0 and  count_parenthesis == 0:
-                len_content_parenthesis = len(token.tokens)
+        # Counting Parenthesis and elements in
+        for token in parsed_sql[0].tokens[index_values:]:
+            if type(token) is not Parenthesis:
+                continue
+
+            if len_content_parenthesis == 0 and count_parenthesis == 0:
+                    for child_token in token.tokens:
+                        if type(child_token) is not IdentifierList:
+                            continue
+
+                        len_content_parenthesis = len([ids for ids in child_token.get_identifiers()])
+
+                    if len_content_parenthesis == 0:
+                        len_content_parenthesis = len(token.tokens)
 
             count_parenthesis += 1
 
-        placeholder_params = list('%s' * len_content_parenthesis)
-        new_sql = sql[:sql.find('VALUES') + len('VALUES')] + placeholder_params.join(',')
+        # Building the new query INSERT
+        placeholder_params = ('?,' * len_content_parenthesis)[:-1]
+        new_sql = query[:query.find('VALUES') + len('VALUES')] + ' (' + placeholder_params + ')'
 
         if count_parenthesis == 0:
             raise ValueError("No values on INSERT statement")
 
+        # Building the tuple of params
         new_params = args if count_parenthesis == 1 else self._get_new_params_ver_11(args, count_parenthesis, len_content_parenthesis)
 
         return (new_sql, new_params)
 
     def _get_new_params_ver_11(self, args, count_parenthesis, len_content_parenthesis):
-        params = ()
-        param_group = ()
-        count = 0
+        """
+        Function: Convert parameters list in
+                  a tuple of tuples style to many inserts
+        Return: <tuple>(<tuple>)
+        """
+        params = []
+        param_group = []
+        count = 1
         for param in args:
             param_group.append(self._transform_param_type(param))
 
-            if count % len_content_parenthesis == 0:
-                params.append(param_group)
-                param_group = ()
+            if count % len_content_parenthesis == 0 and count != 1:
+                params.append(tuple(param_group))
+                param_group = []
+            count += 1
 
-        return params
 
-    def _transform_param_type(param):
+        return tuple(params)
+
+    def _transform_param_type(self, param):
         try:
             return int(param)
         except:
-            return "'%s'" % param
+            pass
 
         try:
             return float(param)
         except:
-            return "'%s'" % param
+            pass
+
+        return "'%s'" % param 
 
     def executemany(self, query, args):
         if djangoVersion[:2] >= (1, 4) and settings.USE_TZ:
@@ -188,6 +220,7 @@ class CursorWrapper(object):
             except TypeError:
                 args = tuple(args)
             if len(args) > 0:
+                print "Hola"
                 query = self.convert_query(query, len(args[0]))
                 ret = self.cursor.executemany(trace(query), trace(args))
                 return trace(ret)
@@ -669,5 +702,3 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         def schema_editor(self, *args, **kwargs):
             "Returns a new instance of this backend's SchemaEditor"
             return DatabaseSchemaEditor( self, *args, **kwargs )
-        
-#
